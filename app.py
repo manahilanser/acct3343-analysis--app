@@ -45,6 +45,9 @@ st.sidebar.header("Filters")
 sectors = sorted(df["sector"].dropna().unique())
 chosen = st.sidebar.multiselect("Sectors to include", sectors, default=sectors)
 min_cap = st.sidebar.number_input("Minimum market cap ($ millions)", 0, 100000, 300, step=100)
+pitch_ticker = st.sidebar.text_input(
+    "60 Second Pitch ticker to exclude", placeholder="Enter ticker"
+).strip().upper()
 
 st.sidebar.subheader("SELL screen")
 acc_cut = st.sidebar.slider("Accrual percentile at or above", 50, 99, 80)
@@ -56,17 +59,22 @@ w_gpa = st.sidebar.slider("Weight on profitability (vs value)", 0.0, 1.0, 0.5, 0
 n_buy = st.sidebar.slider("Number of BUY names", 5, 50, 20)
 
 screen = df[df["sector"].isin(chosen) & (df["market_cap"] >= min_cap * 1e6)].copy()
+if pitch_ticker:
+    screen = screen[screen["ticker"].str.upper() != pitch_ticker]
 
 # ---------- 4. SELL screen: earnings-quality red flags ----------
 screen["flag_STA"] = screen["STA_pct"] >= acc_cut
 screen["flag_SNOA"] = screen["SNOA_pct"] >= acc_cut
 screen["flag_Z"] = screen["Altman_Z"] < z_cut
 screen["red_flags"] = screen[["flag_STA", "flag_SNOA", "flag_Z"]].sum(axis=1)
+screen["risk_data_complete"] = screen[["STA_pct", "SNOA_pct", "Altman_Z"]].notna().all(axis=1)
 sell = (screen[screen["red_flags"] >= flags_needed]
         .sort_values(["red_flags", "STA_pct"], ascending=False))
 
 # ---------- 5. BUY screen: a different analysis (quality + value rank) ----------
-buy_pool = screen[(screen["red_flags"] == 0)].dropna(subset=["GPA_pct", "BM_pct"]).copy()
+buy_pool = screen[
+    screen["risk_data_complete"] & (screen["red_flags"] == 0)
+].dropna(subset=["GPA_pct", "BM_pct"]).copy()
 buy_pool["buy_score"] = w_gpa * buy_pool["GPA_pct"] + (1 - w_gpa) * buy_pool["BM_pct"]
 buy = buy_pool.sort_values("buy_score", ascending=False).head(n_buy)
 
@@ -92,38 +100,77 @@ with right:
 # ---------- 8. Chart ----------
 st.subheader("Where the candidates sit")
 plot = screen.dropna(subset=["STA", "Altman_Z"]).copy()
-plot["group"] = np.where(plot["ticker"].isin(sell["ticker"]), "SELL",
-                 np.where(plot["ticker"].isin(buy["ticker"]), "BUY", "Other"))
-fig = px.scatter(plot, x="STA", y="Altman_Z", color="group", hover_name="ticker",
-                 color_discrete_map={"SELL": "#C4501F", "BUY": "#1F5F8B", "Other": "#C8C8C8"})
-fig.add_hline(y=z_cut, line_dash="dash")
-st.plotly_chart(fig, use_container_width=True)
+if plot.empty:
+    st.info("No companies have both accrual and Altman Z data for this chart.")
+else:
+    plot["group"] = np.where(plot["ticker"].isin(sell["ticker"]), "SELL",
+                     np.where(plot["ticker"].isin(buy["ticker"]), "BUY", "Other"))
+    fig = px.scatter(plot, x="STA", y="Altman_Z", color="group", hover_name="ticker",
+                     color_discrete_map={"SELL": "#C4501F", "BUY": "#1F5F8B", "Other": "#C8C8C8"})
+    fig.add_hline(y=z_cut, line_dash="dash")
+    st.plotly_chart(fig, width="stretch")
 
 # ---------- 9. Company drill-down ----------
 st.subheader("Company drill-down")
-pick = st.selectbox("Choose a company", screen["ticker"].sort_values())
-row = screen[screen["ticker"] == pick].iloc[0]
-st.write(f"**{row['name']}** · {row['sector']} · {row['industry']}")
-st.dataframe(pd.DataFrame({
-    "Measure": ["GPA", "B/M", "STA", "Scaled NOA", "Altman Z", "Red flags"],
-    "Value": [row["GPA"], row["BM"], row["STA"], row["SNOA"], row["Altman_Z"], row["red_flags"]],
-    "Percentile": [row["GPA_pct"], row["BM_pct"], row["STA_pct"], row["SNOA_pct"], None, None],
-}).round(2), hide_index=True)
+if screen.empty:
+    st.info("No companies match the current filters. Adjust the sector or market-cap filters.")
+else:
+    pick = st.selectbox("Choose a company", screen["ticker"].sort_values())
+    row = screen[screen["ticker"] == pick].iloc[0]
+    st.write(f"**{row['name']}** · {row['sector']} · {row['industry']}")
+    st.dataframe(pd.DataFrame({
+        "Measure": ["GPA", "B/M", "STA", "Scaled NOA", "Altman Z", "Red flags"],
+        "Value": [row["GPA"], row["BM"], row["STA"], row["SNOA"], row["Altman_Z"], row["red_flags"]],
+        "Percentile": [row["GPA_pct"], row["BM_pct"], row["STA_pct"], row["SNOA_pct"], None, None],
+    }).round(2), hide_index=True)
 
 # ---------- 10. Conclusions and methodology ----------
 st.subheader("Investment conclusions")
-st.markdown("""
-**Top SELL:** *Write your case here — why the flags matter for this company, what the
-cash flow statement shows, and what would make you wrong.*
+st.caption("The active filters determine these screen leaders. Screen results are analytical signals, not personalized investment advice.")
+st.write("The BUY screen ranks profitability and book-to-market; the SELL screen uses accruals, scaled net operating assets, and distress. These are distinct factor approaches, not opposite sides of one score.")
 
-**Top BUY:** *Write your case here.*
-""")
+if sell.empty:
+    st.markdown("**SELL screen:** No companies meet the current red-flag threshold.")
+else:
+    top_sell = sell.iloc[0]
+    sell_reasons = []
+    if top_sell["flag_STA"]:
+        sell_reasons.append(
+            f"STA is {top_sell['STA']:.2f} (universe percentile {top_sell['STA_pct']:.0f}), meaning net income materially exceeds operating cash flow relative to assets"
+        )
+    if top_sell["flag_SNOA"]:
+        sell_reasons.append(
+            f"scaled NOA is {top_sell['SNOA']:.2f} (universe percentile {top_sell['SNOA_pct']:.0f})"
+        )
+    if top_sell["flag_Z"]:
+        sell_reasons.append(f"Altman Z is {top_sell['Altman_Z']:.2f}, below the selected {z_cut:.2f} threshold")
+    st.markdown(f"**SELL screen leader: {top_sell['ticker']} · {top_sell['name']}**")
+    st.write(
+        f"{'; '.join(sell_reasons)}. The short case is stronger if weak cash conversion and balance-sheet deterioration persist versus prior years and industry peers. It weakens if accruals reflect temporary working-capital timing or the company improves cash conversion. These signals do not establish misreporting or predict a price decline."
+    )
+
+if buy.empty:
+    st.markdown("**BUY screen:** No company has complete risk data, no triggered SELL flags, and the required profitability/value inputs.")
+else:
+    top_buy = buy.iloc[0]
+    st.markdown(f"**BUY screen leader: {top_buy['ticker']} · {top_buy['name']}**")
+    st.write(
+        f"Its weighted quality/value score is {top_buy['buy_score']:.1f}/100, combining a gross-profitability percentile of {top_buy['GPA_pct']:.0f} and a book-to-market percentile of {top_buy['BM_pct']:.0f} at a {w_gpa:.0%}/{1 - w_gpa:.0%} weight. The long case weakens if gross profitability is declining or the high book-to-market ratio reflects impaired assets or a structurally challenged business. This ranking is not a valuation target; check earnings durability, debt, and whether book value is economically meaningful."
+    )
+
+if pitch_ticker:
+    st.caption(f"Excluded 60 Second Pitch ticker: {pitch_ticker}")
 with st.expander("Methodology and formulas"):
-    st.markdown("""
-- **Data:** universe.csv, built in Colab with yfinance (date pulled, firms included, exclusions).
+    data_as_of = df["data_as_of"].dropna().max() if "data_as_of" in df else "not recorded"
+    st.markdown(f"""
+- **Data:** Yahoo Finance annual statements and quote data via yfinance; S&P 500 constituents from the datasets/s-and-p-500-companies public repository, combined with retained nonfinancial companies from the original universe.
+- **Universe:** {df["ticker"].nunique()} companies; Financials are excluded because the distress model is not suitable for banks and insurers.
+- **Retrieved:** {data_as_of}. Market capitalization is quote data; accounting measures use the latest two annual statement periods available per company.
+- **Pitch exclusion:** enter the 60 Second Pitch ticker in the sidebar so it is removed from both candidate lists.
 - **GPA** = gross profit / total assets.  **B/M** = book equity / market cap.
 - **STA** = (net income − operating cash flow) / total assets.
 - **Scaled NOA** = (total debt + equity − cash) / prior-year total assets.
 - **Altman Z** = 1.2·WC/TA + 1.4·RE/TA + 3.3·EBIT/TA + 0.6·MVE/TL + 1.0·Sales/TA.
 - Missing inputs stay missing; a firm with a missing measure cannot trigger that flag.
+- Altman Z is a screening approximation; compare companies with similar business models and validate its fit before interpreting results.
 """)
